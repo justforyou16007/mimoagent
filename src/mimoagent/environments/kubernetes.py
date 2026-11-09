@@ -1,5 +1,7 @@
 """Kubernetes environment for executing commands in Kubernetes pods."""
 
+import contextlib
+import gzip
 import hashlib
 import io
 import os
@@ -9,6 +11,7 @@ import shlex
 import shutil
 import stat
 import tarfile
+import tempfile
 import threading
 import time
 import uuid
@@ -106,6 +109,22 @@ class KubernetesEnvironment(DetachedExecMixin):
     # copy_to builds an equally large in-memory tar archive.
     _COPY_TO_CHUNK_THRESHOLD_BYTES: int = 32 << 20
 
+    # One chunk per exec, so this trades round trips against the frame ceiling
+    # above. 16 MB is the value the large-file path has been running with.
+    _COPY_TO_CHUNK_BYTES: int = 16 << 20
+
+    # gzip level for the copy_to archive. Measured on a source workspace: level 1
+    # is 3.0x smaller than no compression for 0.09s per 13 MB, level 6 only 3.5x
+    # for twice that CPU. Shrinking the payload is what keeps most directories on
+    # the single-exec path instead of the chunked one, so the cheap level wins
+    # twice -- fewer bytes on the wire and fewer exec round trips.
+    _COPY_TO_GZIP_LEVEL: int = 1
+
+    # Below this the archive already fits one exec and the wire time it would
+    # save is not worth a second pass over it -- nor the one-off gzip probe,
+    # which would otherwise land on every pod that only ever copies small files.
+    _COPY_TO_COMPRESS_MIN_BYTES: int = 1 << 20
+
     # The exec websocket crosses a regional load balancer that hard-closes every
     # connection after ~4h. That is a lifetime cap, not an idle timeout, and an
     # exec session cannot be re-attached, so a command that outlives the
@@ -149,6 +168,8 @@ class KubernetesEnvironment(DetachedExecMixin):
         self.instance_id: str | None = None
         self._pod_start_time: float | None = None
         self._cumulative_exec_time: float = 0.0
+        # None until the first copy_to probes the pod; see _pod_supports_tar_gzip.
+        self._pod_tar_gzip_ok: bool | None = None
         self._setup_kubernetes_client()
 
     @staticmethod
@@ -583,6 +604,110 @@ class KubernetesEnvironment(DetachedExecMixin):
         )
         return result
 
+    def _pod_supports_tar_gzip(self) -> bool:
+        """Whether the pod can unpack a gzipped tar. Probed once, then cached.
+
+        Compression is what keeps a large workspace on the single-exec path, but
+        its availability is not safe to assume: the harness installers
+        (`resources/install-common.sh`) install gzip on demand precisely because
+        some task images ship without it, and copy_to runs during env setup,
+        before any of that. One tiny exec per pod answers it; a pod without gzip
+        keeps the uncompressed archive it has always received.
+        """
+        if self._pod_tar_gzip_ok is None:
+            r = self.execute("command -v gzip >/dev/null 2>&1 && echo yes", timeout=60)
+            self._pod_tar_gzip_ok = r.get("returncode") == 0 and (r.get("output") or "").strip().endswith("yes")
+            if not self._pod_tar_gzip_ok:
+                self.logger.info(
+                    f"[pod_copy] pod={self.pod_name} event=gzip_unavailable copy_to archives will be sent uncompressed"
+                )
+        return self._pod_tar_gzip_ok
+
+    def _build_copy_archive(self, fileobj, src_path: str, arcname: str) -> int:
+        """Pack `src_path` into `fileobj` as a tar; return the byte count written.
+
+        Stream mode (``w|``) rather than ``w``: it never seeks, so the spooled
+        file can roll onto disk mid-archive, and it does not need the whole
+        archive resident the way ``BytesIO`` did.
+        """
+        with tarfile.open(fileobj=fileobj, mode="w|") as tf:
+            tf.add(src_path, arcname=arcname, recursive=True)
+        return fileobj.tell()
+
+    def _gzip_into(self, src_fileobj, dst_fileobj) -> int:
+        """gzip `src_fileobj` from position 0 into `dst_fileobj`; return bytes written.
+
+        Compressing the finished archive instead of re-taring with ``w|gz``
+        keeps the source tree read exactly once, which matters when the reason
+        we are compressing at all is that the tree is large.
+        """
+        src_fileobj.seek(0)
+        with gzip.GzipFile(fileobj=dst_fileobj, mode="wb", compresslevel=self._COPY_TO_GZIP_LEVEL) as gz:
+            shutil.copyfileobj(src_fileobj, gz, length=1 << 20)
+        return dst_fileobj.tell()
+
+    def _untar_stdin_cmd(self, dest_dir: str, nbytes: int, *, compressed: bool, as_user: str | None) -> list[str]:
+        z = "z" if compressed else ""
+        script = f"mkdir -p {shlex.quote(dest_dir)} && head -c {nbytes} | tar x{z}mf - -C {shlex.quote(dest_dir)}"
+        if as_user:
+            script = f"su {shlex.quote(as_user)} -s /bin/sh -c {shlex.quote(script)}"
+        return ["/bin/sh", "-c", script]
+
+    def _stage_and_extract_archive(
+        self, fileobj, dest_dir: str, *, compressed: bool, timeout: int, max_retries: int, as_user: str | None = None
+    ) -> dict:
+        """Upload an archive to a pod temp file in chunks, verify it, unpack it.
+
+        This is the directory counterpart to `copy_file_chunked`, and it exists
+        for the same reason: a single exec stdin frame is unreliable above
+        `_COPY_TO_CHUNK_THRESHOLD_BYTES`, and re-sending one cannot fix it --
+        every retry carries the identical oversized frame, so an oversized
+        directory used to fail its whole retry budget and lose the rollout. The
+        per-chunk framing is bounded and idempotent (`dd` writes at a fixed
+        offset), so a lost acknowledgement costs one chunk, not the transfer.
+
+        Unpacking reads the staged file rather than stdin, so `tar` gets a real
+        EOF without the `head -c` guard the streaming path needs, and sha256
+        proves the archive was complete before anything is extracted.
+        """
+        staged = f"/tmp/_copyto_{os.getpid()}_{threading.get_ident()}_{uuid.uuid4().hex[:8]}.tar"
+        quoted = shlex.quote(staged)
+        t0 = time.time()
+
+        r = self.execute(f"mkdir -p {shlex.quote(dest_dir)} && : > {quoted}")
+        if r.get("returncode") != 0:
+            raise TransportError(f"could not stage archive at {staged}: {r.get('output', '')[-200:]}")
+
+        try:
+            local_digest, chunks = self._upload_fileobj_chunked(
+                fileobj,
+                quoted,
+                chunk_bytes=self._COPY_TO_CHUNK_BYTES,
+                timeout=timeout,
+                max_retries=max_retries,
+                as_user=as_user,
+            )
+            remote = self._remote_sha256(quoted)
+            if remote != local_digest:
+                raise TransportError(
+                    f"sha256 mismatch after staging archive for {dest_dir}: "
+                    f"local {local_digest[:16]} vs pod {remote[:16]}"
+                )
+
+            z = "z" if compressed else ""
+            script = f"tar x{z}mf {quoted} -C {shlex.quote(dest_dir)}"
+            if as_user:
+                script = f"su {shlex.quote(as_user)} -s /bin/sh -c {shlex.quote(script)}"
+            r = self.execute(script, timeout=timeout)
+            if r.get("returncode") != 0:
+                raise TransportError(f"could not unpack staged archive into {dest_dir}: {r.get('output', '')[-300:]}")
+        finally:
+            # The staged copy is pure transport scratch; leaving it behind would
+            # charge the pod's disk twice for every oversized workspace.
+            self.execute(f"rm -f {quoted}")
+
+        return {"chunks": chunks, "seconds": round(time.time() - t0, 1), "sha256": remote}
+
     def copy_to(self, src_path: str, dest_path: str, *, timeout: int = 300, max_retries: int = 10, as_user: str | None = None) -> None:
         copy_t0 = time.time()
         assert self.pod_name and self.pod_started, "Pod not started"
@@ -623,10 +748,65 @@ class KubernetesEnvironment(DetachedExecMixin):
         dest_dir = os.path.dirname(dest_path) or "."
         arcname = os.path.basename(dest_path) or os.path.basename(src_path)
 
-        buf = io.BytesIO()
-        with tarfile.open(fileobj=buf, mode="w") as tf:
-            tf.add(src_path, arcname=arcname, recursive=True)
-        tar_bytes = buf.getvalue()
+        # Build the archive into a spooled file: it stays in memory while it is
+        # small and rolls onto disk when it is not, so a 32-worker setup burst
+        # cannot hold N oversized archives in RAM the way ``BytesIO.getvalue()``
+        # did (that also kept two copies at once).
+        with contextlib.ExitStack() as stack:
+            plain = stack.enter_context(
+                tempfile.SpooledTemporaryFile(max_size=self._COPY_TO_CHUNK_THRESHOLD_BYTES, suffix=".tar")
+            )
+            tar_len = self._build_copy_archive(plain, src_path, arcname)
+            payload, payload_len, compressed = plain, tar_len, False
+
+            # Compression is what keeps a big workspace on the one-exec path and
+            # what cuts its chunk count when it cannot be. It is skipped below
+            # _COPY_TO_COMPRESS_MIN_BYTES so the common small copy keeps the
+            # exact bytes and the exact single exec it has always used -- and
+            # never pays for the gzip probe. Compressing the finished archive
+            # rather than re-taring means the source tree is read once.
+            if tar_len >= self._COPY_TO_COMPRESS_MIN_BYTES and self._pod_supports_tar_gzip():
+                gz = stack.enter_context(
+                    tempfile.SpooledTemporaryFile(max_size=self._COPY_TO_CHUNK_THRESHOLD_BYTES, suffix=".tar.gz")
+                )
+                payload_len = self._gzip_into(plain, gz)
+                payload, compressed = gz, True
+
+            # Above the single-frame ceiling, streaming cannot work and retrying
+            # it cannot either -- every attempt re-sends the same oversized
+            # frame. Stage the archive in bounded chunks instead, then unpack it
+            # pod-side from a file that is known-complete by sha256.
+            if payload_len >= self._COPY_TO_CHUNK_THRESHOLD_BYTES:
+                payload.seek(0)
+                try:
+                    info = self._stage_and_extract_archive(
+                        payload,
+                        dest_dir,
+                        compressed=compressed,
+                        timeout=timeout,
+                        max_retries=max_retries,
+                        as_user=as_user,
+                    )
+                except Exception:
+                    copy_duration = time.time() - copy_t0
+                    self.logger.error(
+                        f"[pod_copy] pod={self.pod_name} event=copy_to_failed "
+                        f"mode=dir_chunked src={src_path} dest={dest_path} "
+                        f"bytes={payload_len} tar_bytes={tar_len} gz={compressed} "
+                        f"duration={copy_duration:.2f}s"
+                    )
+                    raise
+                copy_duration = time.time() - copy_t0
+                self.logger.info(
+                    f"[pod_copy] pod={self.pod_name} event=copy_to "
+                    f"mode=dir_chunked src={src_path} dest={dest_path} "
+                    f"bytes={payload_len} tar_bytes={tar_len} gz={compressed} "
+                    f"chunks={info['chunks']} duration={copy_duration:.2f}s"
+                )
+                return
+
+            payload.seek(0)
+            tar_bytes = payload.read()
 
         # Bound the pod-side read to exactly the archive size with ``head -c``.
         # ``write_stdin("")`` does NOT close the exec stdin channel (it only
@@ -640,15 +820,11 @@ class KubernetesEnvironment(DetachedExecMixin):
         # closes the pipe after exactly N bytes, handing tar a real EOF on both
         # GNU and BusyBox. Belt-and-suspenders: keep ``tar xmf -`` reading the
         # same stream.
-        untar_script = f"mkdir -p {shlex.quote(dest_dir)} && head -c {len(tar_bytes)} | tar xmf - -C {shlex.quote(dest_dir)}"
-        if as_user:
-            untar_script = f"su {shlex.quote(as_user)} -s /bin/sh -c {shlex.quote(untar_script)}"
-        untar_cmd = ["/bin/sh", "-c", untar_script]
-
         last_err = None
         for attempt in range(1, max_retries + 1):
             resp = None
             try:
+                untar_cmd = self._untar_stdin_cmd(dest_dir, len(tar_bytes), compressed=compressed, as_user=as_user)
                 resp = stream(
                     self.v1_api.connect_get_namespaced_pod_exec,
                     self.pod_name,
@@ -740,29 +916,20 @@ class KubernetesEnvironment(DetachedExecMixin):
         if r.get("returncode") != 0:
             raise TransportError(f"could not truncate {dest_path}: {r.get('output', '')[-200:]}")
 
-        local = hashlib.sha256()
         t0 = time.time()
-        idx = 0
         with open(src_path, "rb") as fh:
-            while True:
-                chunk = fh.read(chunk_bytes)
-                if not chunk:
-                    break
-                local.update(chunk)
-                self._write_chunk(quoted, chunk, idx, chunk_bytes, timeout=timeout, max_retries=max_retries, as_user=as_user)
-                idx += 1
+            local_digest, idx = self._upload_fileobj_chunked(
+                fh, quoted, chunk_bytes=chunk_bytes, timeout=timeout, max_retries=max_retries, as_user=as_user
+            )
 
-        r = self.execute(f"sha256sum {quoted} | cut -d' ' -f1", timeout=600)
-        out = (r.get("output") or "").strip()
-        remote = out.splitlines()[-1] if out else ""
-        if remote != local.hexdigest():
+        remote = self._remote_sha256(quoted)
+        if remote != local_digest:
             # A short file left behind is worse than none: a consumer sees the path,
             # untars it silently wrong, and blames the submission. Removing it makes
             # the absence visible to whoever reads the assets.
             self.execute(f"rm -f {quoted}")
             raise TransportError(
-                f"sha256 mismatch after upload of {dest_path}: "
-                f"local {local.hexdigest()[:16]} vs pod {remote[:16]} (removed)"
+                f"sha256 mismatch after upload of {dest_path}: local {local_digest[:16]} vs pod {remote[:16]} (removed)"
             )
 
         mode = stat.S_IMODE(os.stat(src_path).st_mode)
@@ -773,6 +940,33 @@ class KubernetesEnvironment(DetachedExecMixin):
                 f"could not preserve mode {mode:o} on {dest_path}: {r.get('output', '')[-200:]} (removed)"
             )
         return {"bytes": size, "chunks": idx, "seconds": round(time.time() - t0, 1), "sha256": remote}
+
+    def _upload_fileobj_chunked(
+        self, fh, quoted_dest: str, *, chunk_bytes: int, timeout: int, max_retries: int, as_user: str | None = None
+    ) -> tuple[str, int]:
+        """Write everything left in `fh` to an already-truncated pod path.
+
+        Returns the locally computed sha256 and the chunk count; the caller
+        compares the digest against the pod's and owns the destination's
+        lifetime. Reads lazily so the source can be larger than memory.
+        """
+        local = hashlib.sha256()
+        idx = 0
+        while True:
+            chunk = fh.read(chunk_bytes)
+            if not chunk:
+                break
+            local.update(chunk)
+            self._write_chunk(
+                quoted_dest, chunk, idx, chunk_bytes, timeout=timeout, max_retries=max_retries, as_user=as_user
+            )
+            idx += 1
+        return local.hexdigest(), idx
+
+    def _remote_sha256(self, quoted_path: str) -> str:
+        r = self.execute(f"sha256sum {quoted_path} | cut -d' ' -f1", timeout=600)
+        out = (r.get("output") or "").strip()
+        return out.splitlines()[-1] if out else ""
 
     def _write_chunk(
         self, quoted_dest: str, chunk: bytes, idx: int, chunk_bytes: int, *, timeout: int, max_retries: int, as_user: str | None = None
